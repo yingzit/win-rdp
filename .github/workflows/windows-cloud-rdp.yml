@@ -15,7 +15,7 @@ on:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 355          # 5h55m，避开 6h 硬上限，给 setup 留缓冲
+    timeout-minutes: 355
 
     steps:
       # ============================================================
@@ -29,25 +29,29 @@ jobs:
           Write-Host "✅ RDP + Firewall 已就绪"
 
       # ============================================================
-      # 2. 生成随机密码 + 创建管理员账户
+      # 2. 生成纯 ASCII 随机密码 + 创建管理员账户
       # ============================================================
       - name: 2. Generate Random Password & Create Admin
         id: gen_pwd
         run: |
-          # ---- 生成强随机密码（保证含大小写/数字/符号，长度 22）----
-          $rand     = [guid]::NewGuid().ToString('N').Substring(0,16)
-          $password = 'Aa1!' + $rand + '@#'
+          # ---- 生成 20 位纯字母数字随机串 ----
+          $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'
+          $bytes = New-Object byte[] 20
+          [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+          $rand = -join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] })
 
-          # 打印到日志（这是你要抄的那一行）
+          # ---- 组合成满足 Windows 复杂度要求的密码 ----
+          $password = 'Nvd9' + $rand + 'Zx7'
+
           Write-Host ""
           Write-Host "==============================================" -ForegroundColor Yellow
           Write-Host "  RDP PASSWORD (本次运行生成，仅此一次)" -ForegroundColor Yellow
           Write-Host "  $password" -ForegroundColor Green
+          Write-Host "  (纯字母数字，无符号，可放心复制)" -ForegroundColor DarkGray
           Write-Host "==============================================" -ForegroundColor Yellow
           Write-Host ""
 
-          # 传给后续 step 使用
-          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
 
           # ---- 创建 / 重置 NvdAdmin ----
           $sec = ConvertTo-SecureString $password -AsPlainText -Force
@@ -67,36 +71,29 @@ jobs:
       - name: 3. Register First-Login Chinese Setup (RunOnce)
         run: |
           $script = @'
-          # 首次登录中文化 —— 由 HKLM\RunOnce 触发
           $ErrorActionPreference = 'Continue'
 
-          # 1) 区域文化
           Set-Culture zh-CN -ErrorAction SilentlyContinue
-
-          # 2) UI 语言 override（本次登录不生效，下次登录才变中文）
           Set-WinUILanguageOverride zh-CN -ErrorAction SilentlyContinue
 
-          # 3) 日期时间格式（半角冒号，避免全角显示）
           $intl = "HKCU:\Control Panel\International"
           Set-ItemProperty -Path $intl -Name "sShortDate"  -Value "yyyy/M/d"
           Set-ItemProperty -Path $intl -Name "sLongDate"   -Value "yyyy'年'M'月'd'日'"
           Set-ItemProperty -Path $intl -Name "sShortTime"  -Value "H:mm"
           Set-ItemProperty -Path $intl -Name "sTimeFormat" -Value "H:mm:ss"
 
-          # 4) 尝试装语言包（Win11/Server2025 才有，失败不影响）
           try { Install-Language zh-CN -ErrorAction Stop } catch {}
 
-          # 5) 自删，只跑一次
           Remove-Item "$env:ProgramData\rdp-first-login.ps1" -Force -ErrorAction SilentlyContinue
           '@
 
           Set-Content -Path "C:\ProgramData\rdp-first-login.ps1" -Value $script -Encoding UTF8
-          Write-Host "✅ 首次登录脚本已写入 C:\ProgramData\rdp-first-login.ps1"
+          Write-Host "✅ 首次登录脚本已写入"
 
           $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\ProgramData\rdp-first-login.ps1"'
           Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" `
                            -Name "!RdpChineseSetup" -Value $cmd -Type String
-          Write-Host "✅ RunOnce 已注册（NvdAdmin 首次登录时触发）"
+          Write-Host "✅ RunOnce 已注册"
 
       # ============================================================
       # 4. 安装并连接 Tailscale
@@ -122,15 +119,14 @@ jobs:
             $tsArgs += "--accept-routes"
           }
 
-          # 关键：不打印原始输出，避免 authkey 意外进日志
           & $tsExe @tsArgs *>&1 | Out-Null
           Start-Sleep -Seconds 8
-          Write-Host "✅ Tailscale 已连接（authkey 未回显）"
+          Write-Host "✅ Tailscale 已连接"
 
       # ============================================================
-      # 5. 自检：Tailscale 状态 + 公网出口 IP + 打印连接信息
+      # 5. 自检 + 打印连接信息
       # ============================================================
-      - name: 5. Self-Check (Tailscale + Public IP)
+      - name: 5. Self-Check
         run: |
           $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
 
@@ -143,7 +139,7 @@ jobs:
           Write-Host $tsIp
 
           Write-Host ""
-          Write-Host "===== Public IP (exit-node 生效时会变成出口节点 IP) ====="
+          Write-Host "===== Public IP ====="
           try {
             $pub = Invoke-RestMethod -Uri "https://ifconfig.me/ip" -TimeoutSec 20
             Write-Host "Public IP : $pub"
@@ -155,7 +151,7 @@ jobs:
           Write-Host "=========================================="
           Write-Host "  RDP SERVER IS READY"
           Write-Host "  Tailscale IP : $tsIp"
-          Write-Host "  Username     : NvdAdmin"
+          Write-Host "  Username     : .\NvdAdmin"
           Write-Host "  Password     : $env:RDP_PASSWORD" -ForegroundColor Green
           Write-Host "  Proxy Mode   : ${{ github.event.inputs.proxy_mode }}"
           if ("${{ github.event.inputs.proxy_mode }}" -eq "exit-node") {
@@ -165,12 +161,12 @@ jobs:
           Write-Host "=========================================="
 
       # ============================================================
-      # 6. 清理临时文件
+      # 6. 清理
       # ============================================================
       - name: 6. Cleanup
         run: |
           Remove-Item "C:\tailscale.msi" -Force -ErrorAction SilentlyContinue
-          Write-Host "✅ 临时文件已清理"
+          Write-Host "✅ 清理完成"
 
       # ============================================================
       # 7. 保活 5 小时
@@ -178,7 +174,7 @@ jobs:
       - name: 7. Keep Alive (5 hours)
         run: |
           $end = (Get-Date).AddMinutes(300)
-          Write-Host "⏰ 保活至 $end（北京时间）"
+          Write-Host "⏰ 保活至 $end"
 
           while ((Get-Date) -lt $end) {
             Start-Sleep -Seconds 60
