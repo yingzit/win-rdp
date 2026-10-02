@@ -1,0 +1,191 @@
+name: Windows Cloud RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      proxy_mode:
+        description: "代理模式（off=仅RDP / exit-node=出口代理）"
+        required: false
+        default: "off"
+        type: choice
+        options:
+          - off
+          - exit-node
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 355          # 5h55m，避开 6h 硬上限，给 setup 留缓冲
+
+    steps:
+      # ============================================================
+      # 1. 开启远程桌面 + 防火墙
+      # ============================================================
+      - name: 1. Enable RDP & Firewall
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Write-Host "✅ RDP + Firewall 已就绪"
+
+      # ============================================================
+      # 2. 生成随机密码 + 创建管理员账户
+      # ============================================================
+      - name: 2. Generate Random Password & Create Admin
+        id: gen_pwd
+        run: |
+          # ---- 生成强随机密码（保证含大小写/数字/符号，长度 22）----
+          $rand     = [guid]::NewGuid().ToString('N').Substring(0,16)
+          $password = 'Aa1!' + $rand + '@#'
+
+          # 打印到日志（这是你要抄的那一行）
+          Write-Host ""
+          Write-Host "==============================================" -ForegroundColor Yellow
+          Write-Host "  RDP PASSWORD (本次运行生成，仅此一次)" -ForegroundColor Yellow
+          Write-Host "  $password" -ForegroundColor Green
+          Write-Host "==============================================" -ForegroundColor Yellow
+          Write-Host ""
+
+          # 传给后续 step 使用
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          # ---- 创建 / 重置 NvdAdmin ----
+          $sec = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "NvdAdmin" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "NvdAdmin" -Password $sec -PasswordNeverExpires
+            Write-Host "✅ NvdAdmin 已创建"
+          } else {
+            Set-LocalUser -Name "NvdAdmin" -Password $sec
+            Write-Host "ℹ️ NvdAdmin 已存在，密码已重置为本次随机值"
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "NvdAdmin" -ErrorAction SilentlyContinue
+          Write-Host "✅ NvdAdmin 已加入 Administrators 组"
+
+      # ============================================================
+      # 3. 注册 NvdAdmin 首次登录时的中文化脚本（RunOnce）
+      # ============================================================
+      - name: 3. Register First-Login Chinese Setup (RunOnce)
+        run: |
+          $script = @'
+          # 首次登录中文化 —— 由 HKLM\RunOnce 触发
+          $ErrorActionPreference = 'Continue'
+
+          # 1) 区域文化
+          Set-Culture zh-CN -ErrorAction SilentlyContinue
+
+          # 2) UI 语言 override（本次登录不生效，下次登录才变中文）
+          Set-WinUILanguageOverride zh-CN -ErrorAction SilentlyContinue
+
+          # 3) 日期时间格式（半角冒号，避免全角显示）
+          $intl = "HKCU:\Control Panel\International"
+          Set-ItemProperty -Path $intl -Name "sShortDate"  -Value "yyyy/M/d"
+          Set-ItemProperty -Path $intl -Name "sLongDate"   -Value "yyyy'年'M'月'd'日'"
+          Set-ItemProperty -Path $intl -Name "sShortTime"  -Value "H:mm"
+          Set-ItemProperty -Path $intl -Name "sTimeFormat" -Value "H:mm:ss"
+
+          # 4) 尝试装语言包（Win11/Server2025 才有，失败不影响）
+          try { Install-Language zh-CN -ErrorAction Stop } catch {}
+
+          # 5) 自删，只跑一次
+          Remove-Item "$env:ProgramData\rdp-first-login.ps1" -Force -ErrorAction SilentlyContinue
+          '@
+
+          Set-Content -Path "C:\ProgramData\rdp-first-login.ps1" -Value $script -Encoding UTF8
+          Write-Host "✅ 首次登录脚本已写入 C:\ProgramData\rdp-first-login.ps1"
+
+          $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\ProgramData\rdp-first-login.ps1"'
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" `
+                           -Name "!RdpChineseSetup" -Value $cmd -Type String
+          Write-Host "✅ RunOnce 已注册（NvdAdmin 首次登录时触发）"
+
+      # ============================================================
+      # 4. 安装并连接 Tailscale
+      # ============================================================
+      - name: 4. Install & Connect Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $proxyMode = "${{ github.event.inputs.proxy_mode }}"
+
+          if ($proxyMode -eq "exit-node") {
+            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter" -Value 1
+          }
+
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
+          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+          Start-Sleep -Seconds 5
+
+          $tsExe  = "C:\Program Files\Tailscale\tailscale.exe"
+          $tsArgs = @("up", "--authkey=$Env:TAILSCALE_AUTHKEY", "--hostname=github-rdp")
+          if ($proxyMode -eq "exit-node") {
+            $tsArgs += "--advertise-exit-node"
+            $tsArgs += "--accept-routes"
+          }
+
+          # 关键：不打印原始输出，避免 authkey 意外进日志
+          & $tsExe @tsArgs *>&1 | Out-Null
+          Start-Sleep -Seconds 8
+          Write-Host "✅ Tailscale 已连接（authkey 未回显）"
+
+      # ============================================================
+      # 5. 自检：Tailscale 状态 + 公网出口 IP + 打印连接信息
+      # ============================================================
+      - name: 5. Self-Check (Tailscale + Public IP)
+        run: |
+          $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
+
+          Write-Host "===== tailscale status ====="
+          & $tsExe status
+
+          Write-Host ""
+          Write-Host "===== Tailscale IPv4 ====="
+          $tsIp = & $tsExe ip -4
+          Write-Host $tsIp
+
+          Write-Host ""
+          Write-Host "===== Public IP (exit-node 生效时会变成出口节点 IP) ====="
+          try {
+            $pub = Invoke-RestMethod -Uri "https://ifconfig.me/ip" -TimeoutSec 20
+            Write-Host "Public IP : $pub"
+          } catch {
+            Write-Host "⚠️ 出口 IP 查询失败：$($_.Exception.Message)"
+          }
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "  RDP SERVER IS READY"
+          Write-Host "  Tailscale IP : $tsIp"
+          Write-Host "  Username     : NvdAdmin"
+          Write-Host "  Password     : $env:RDP_PASSWORD" -ForegroundColor Green
+          Write-Host "  Proxy Mode   : ${{ github.event.inputs.proxy_mode }}"
+          if ("${{ github.event.inputs.proxy_mode }}" -eq "exit-node") {
+            Write-Host "  >> 需在 Tailscale 后台勾选 Exit Node:"
+            Write-Host "     https://login.tailscale.com/admin/machines"
+          }
+          Write-Host "=========================================="
+
+      # ============================================================
+      # 6. 清理临时文件
+      # ============================================================
+      - name: 6. Cleanup
+        run: |
+          Remove-Item "C:\tailscale.msi" -Force -ErrorAction SilentlyContinue
+          Write-Host "✅ 临时文件已清理"
+
+      # ============================================================
+      # 7. 保活 5 小时
+      # ============================================================
+      - name: 7. Keep Alive (5 hours)
+        run: |
+          $end = (Get-Date).AddMinutes(300)
+          Write-Host "⏰ 保活至 $end（北京时间）"
+
+          while ((Get-Date) -lt $end) {
+            Start-Sleep -Seconds 60
+            $rem = [int]($end - (Get-Date)).TotalMinutes
+            Write-Host "alive @ $((Get-Date).ToString('HH:mm:ss')) | 剩余 $rem min"
+          }
+
+          Write-Host "=========================================="
+          Write-Host "  ⚠️ RDP 会话即将断开 — 请保存工作！"
+          Write-Host "=========================================="
