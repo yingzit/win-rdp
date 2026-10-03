@@ -34,13 +34,11 @@ jobs:
       - name: 2. Generate Random Password & Create Admin
         id: gen_pwd
         run: |
-          # ---- 生成 20 位纯字母数字随机串 ----
           $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'
           $bytes = New-Object byte[] 20
           [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
           $rand = -join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] })
 
-          # ---- 组合成满足 Windows 复杂度要求的密码 ----
           $password = 'Nvd9' + $rand + 'Zx7'
 
           Write-Host ""
@@ -53,7 +51,6 @@ jobs:
 
           "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
 
-          # ---- 创建 / 重置 NvdAdmin ----
           $sec = ConvertTo-SecureString $password -AsPlainText -Force
           if (-not (Get-LocalUser -Name "NvdAdmin" -ErrorAction SilentlyContinue)) {
             New-LocalUser -Name "NvdAdmin" -Password $sec -PasswordNeverExpires
@@ -96,50 +93,153 @@ jobs:
           Write-Host "✅ RunOnce 已注册"
 
       # ============================================================
-      # 4. 安装并连接 Tailscale
+      # 4. 安装并启动 ngrok（暴露 RDP 3389 和 Xray 8443）
       # ============================================================
-      - name: 4. Install & Connect Tailscale
+      - name: 4. Install & Start ngrok
         env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
         run: |
-          $proxyMode = "${{ github.event.inputs.proxy_mode }}"
+          $ngrokDir = "C:\ngrok"
+          New-Item -ItemType Directory -Path $ngrokDir -Force | Out-Null
 
-          if ($proxyMode -eq "exit-node") {
-            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter" -Value 1
-          }
+          Write-Host "下载 ngrok..."
+          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "$ngrokDir\ngrok.zip" -UseBasicParsing
+          Expand-Archive -Path "$ngrokDir\ngrok.zip" -DestinationPath $ngrokDir -Force
 
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
-          Start-Sleep -Seconds 5
+          Write-Host "配置 authtoken..."
+          & "$ngrokDir\ngrok.exe" config add-authtoken $env:NGROK_AUTHTOKEN | Out-Null
 
-          $tsExe  = "C:\Program Files\Tailscale\tailscale.exe"
-          $tsArgs = @("up", "--authkey=$Env:TAILSCALE_AUTHKEY", "--hostname=github-rdp")
-          if ($proxyMode -eq "exit-node") {
-            $tsArgs += "--advertise-exit-node"
-            $tsArgs += "--accept-routes"
-          }
+          $configYml = @"
+version: "2"
+tunnels:
+  rdp:
+    proto: tcp
+    addr: 3389
+  xray:
+    proto: tcp
+    addr: 8443
+"@
+          Set-Content -Path "$ngrokDir\ngrok.yml" -Value $configYml -Encoding UTF8
 
-          & $tsExe @tsArgs *>&1 | Out-Null
-          Start-Sleep -Seconds 8
-          Write-Host "✅ Tailscale 已连接"
+          Write-Host "启动 ngrok 隧道..."
+          Start-Process -FilePath "$ngrokDir\ngrok.exe" `
+            -ArgumentList "start --all --config $ngrokDir\ngrok.yml" `
+            -WindowStyle Hidden
+
+          Start-Sleep -Seconds 12
+
+          Write-Host "获取隧道信息..."
+          $tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels"
+          $rdpUrl  = ($tunnels.tunnels | Where-Object { $_.name -eq "rdp" }).public_url
+          $xrayUrl = ($tunnels.tunnels | Where-Object { $_.name -eq "xray" }).public_url
+
+          if (-not $rdpUrl)  { Write-Error "未获取到 RDP 隧道"; exit 1 }
+          if (-not $xrayUrl) { Write-Error "未获取到 Xray 隧道"; exit 1 }
+
+          $rdpHost = ($rdpUrl -replace 'tcp://', '') -split ':'
+          $xrayHost = ($xrayUrl -replace 'tcp://', '') -split ':'
+
+          "RDP_HOST=$($rdpHost[0])"     | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+          "RDP_PORT=$($rdpHost[1])"     | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+          "XRAY_HOST=$($xrayHost[0])"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+          "XRAY_PORT=$($xrayHost[1])"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
+          Write-Host "✅ ngrok 隧道已启动"
+          Write-Host "  RDP 公网地址 : $rdpUrl"
+          Write-Host "  Xray 公网地址: $xrayUrl"
 
       # ============================================================
-      # 5. 自检 + 打印连接信息
+      # 5. 安装并配置 Xray 自建节点（仅监听 127.0.0.1）
       # ============================================================
-      - name: 5. Self-Check
+      - name: 5. Install & Configure Xray Node
         run: |
-          $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
+          $port = 8443
+          $uuid = [guid]::NewGuid().ToString()
+          $xrayDir = "C:\xray"
+          New-Item -ItemType Directory -Path $xrayDir -Force | Out-Null
 
-          Write-Host "===== tailscale status ====="
-          & $tsExe status
+          Write-Host "下载 Xray..."
+          $url = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$xrayDir\xray.zip" -UseBasicParsing
+          Expand-Archive -Path "$xrayDir\xray.zip" -DestinationPath $xrayDir -Force
+
+          $config = @{
+            inbounds = @(
+              @{
+                port = $port
+                listen = "127.0.0.1"
+                protocol = "vless"
+                settings = @{
+                  clients = @(
+                    @{
+                      id = $uuid
+                      flow = ""
+                    }
+                  )
+                  decryption = "none"
+                }
+                streamSettings = @{
+                  network = "tcp"
+                  security = "none"
+                }
+              }
+            )
+            outbounds = @(
+              @{
+                protocol = "freedom"
+                settings = @{}
+              }
+            )
+          } | ConvertTo-Json -Depth 10
+
+          Set-Content -Path "$xrayDir\config.json" -Value $config -Encoding UTF8
+
+          Start-Process -FilePath "$xrayDir\xray.exe" `
+            -ArgumentList @("run", "-c", "$xrayDir\config.json") `
+            -WindowStyle Hidden
+
+          Start-Sleep -Seconds 3
+
+          $vlessLink = "vless://$uuid@$env:XRAY_HOST:$env:XRAY_PORT?encryption=none&security=none&type=tcp#Windows-RDP-Node"
 
           Write-Host ""
-          Write-Host "===== Tailscale IPv4 ====="
-          $tsIp = & $tsExe ip -4
-          Write-Host $tsIp
+          Write-Host "=========================================="
+          Write-Host "  Xray 自建节点已启动（通过 ngrok 暴露）"
+          Write-Host "  协议     : VLESS + TCP"
+          Write-Host "  地址     : $env:XRAY_HOST"
+          Write-Host "  端口     : $env:XRAY_PORT"
+          Write-Host "  UUID     : $uuid"
+          Write-Host "  分享链接 : $vlessLink" -ForegroundColor Green
+          Write-Host "=========================================="
+          Write-Host ""
+
+          "XRAY_VLESS_LINK=$vlessLink" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
+      # ============================================================
+      # 6. 自检 + 打印连接信息
+      # ============================================================
+      - name: 6. Self-Check
+        run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "  RDP SERVER IS READY (公网直连)"
+          Write-Host "  RDP 地址     : $env:RDP_HOST"
+          Write-Host "  RDP 端口     : $env:RDP_PORT"
+          Write-Host "  用户名       : .\NvdAdmin"
+          Write-Host "  密码         : $env:RDP_PASSWORD" -ForegroundColor Green
+          Write-Host "  代理模式     : ${{ github.event.inputs.proxy_mode }}"
+          Write-Host "=========================================="
+          Write-Host ""
+
+          Write-Host "===== Xray 自建节点 ====="
+          if ($env:XRAY_VLESS_LINK) {
+            Write-Host $env:XRAY_VLESS_LINK -ForegroundColor Green
+          } else {
+            Write-Host "⚠️ Xray 节点未配置或未成功启动"
+          }
 
           Write-Host ""
-          Write-Host "===== Public IP ====="
+          Write-Host "===== 公网 IP ====="
           try {
             $pub = Invoke-RestMethod -Uri "https://ifconfig.me/ip" -TimeoutSec 20
             Write-Host "Public IP : $pub"
@@ -147,31 +247,19 @@ jobs:
             Write-Host "⚠️ 出口 IP 查询失败：$($_.Exception.Message)"
           }
 
-          Write-Host ""
-          Write-Host "=========================================="
-          Write-Host "  RDP SERVER IS READY"
-          Write-Host "  Tailscale IP : $tsIp"
-          Write-Host "  Username     : .\NvdAdmin"
-          Write-Host "  Password     : $env:RDP_PASSWORD" -ForegroundColor Green
-          Write-Host "  Proxy Mode   : ${{ github.event.inputs.proxy_mode }}"
-          if ("${{ github.event.inputs.proxy_mode }}" -eq "exit-node") {
-            Write-Host "  >> 需在 Tailscale 后台勾选 Exit Node:"
-            Write-Host "     https://login.tailscale.com/admin/machines"
-          }
-          Write-Host "=========================================="
-
       # ============================================================
-      # 6. 清理
+      # 7. 清理
       # ============================================================
-      - name: 6. Cleanup
+      - name: 7. Cleanup
         run: |
-          Remove-Item "C:\tailscale.msi" -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\ngrok\ngrok.zip" -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\xray\xray.zip" -Force -ErrorAction SilentlyContinue
           Write-Host "✅ 清理完成"
 
       # ============================================================
-      # 7. 保活 5 小时
+      # 8. 保活 5 小时
       # ============================================================
-      - name: 7. Keep Alive (5 hours)
+      - name: 8. Keep Alive (5 hours)
         run: |
           $end = (Get-Date).AddMinutes(300)
           Write-Host "⏰ 保活至 $end"
