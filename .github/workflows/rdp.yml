@@ -2,6 +2,15 @@ name: Windows Cloud RDP
 
 on:
   workflow_dispatch:
+    inputs:
+      proxy_mode:
+        description: "代理模式（off=仅RDP / exit-node=出口代理）"
+        required: false
+        default: "off"
+        type: choice
+        options:
+          - off
+          - exit-node
 
 jobs:
   build:
@@ -9,43 +18,300 @@ jobs:
     timeout-minutes: 355
 
     steps:
-      - name: 1. Enable RDP
+      # ============================================================
+      # 1. 开启远程桌面 + 防火墙
+      # ============================================================
+      - name: 1. Enable RDP & Firewall
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Write-Host "✅ RDP + Firewall 已就绪"
 
-      - name: 2. Create Admin
+      # ============================================================
+      # 2. 生成随机密码 + 创建管理员账户
+      # ============================================================
+      - name: 2. Generate Random Password & Create Admin
+        id: gen_pwd
         run: |
           $chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789'
           $bytes = New-Object byte[] 20
           [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
           $rand = -join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] })
+
           $password = 'Nvd9' + $rand + 'Zx7'
+
+          Write-Host ""
+          Write-Host "==============================================" -ForegroundColor Yellow
+          Write-Host "  RDP PASSWORD (本次运行生成，仅此一次)" -ForegroundColor Yellow
+          Write-Host "  $password" -ForegroundColor Green
+          Write-Host "  (纯字母数字，无符号，可放心复制)" -ForegroundColor DarkGray
+          Write-Host "==============================================" -ForegroundColor Yellow
+          Write-Host ""
+
           "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
           $sec = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "NvdAdmin" -Password $sec -PasswordNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "NvdAdmin"
-          Write-Host "PASSWORD: $password"
+          if (-not (Get-LocalUser -Name "NvdAdmin" -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "NvdAdmin" -Password $sec -PasswordNeverExpires
+            Write-Host "✅ NvdAdmin 已创建"
+          } else {
+            Set-LocalUser -Name "NvdAdmin" -Password $sec
+            Write-Host "ℹ️ NvdAdmin 已存在，密码已重置为本次随机值"
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "NvdAdmin" -ErrorAction SilentlyContinue
+          Write-Host "✅ NvdAdmin 已加入 Administrators 组"
 
-      - name: 3. Install ngrok
-        env:
-          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+      # ============================================================
+      # 3. 首次登录中文化（RunOnce）
+      # ============================================================
+      - name: 3. Register First-Login Chinese Setup (RunOnce)
         run: |
-          New-Item -ItemType Directory -Path "C:\ngrok" -Force | Out-Null
-          Invoke-WebRequest -Uri "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "C:\ngrok\ngrok.zip" -UseBasicParsing
-          Expand-Archive -Path "C:\ngrok\ngrok.zip" -DestinationPath "C:\ngrok" -Force
-          & "C:\ngrok\ngrok.exe" config add-authtoken $env:NGROK_AUTHTOKEN
-          Start-Process -FilePath "C:\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -WindowStyle Hidden
-          Start-Sleep -Seconds 12
-          $tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels"
-          $url = $tunnels.tunnels[0].public_url
-          Write-Host "RDP URL: $url"
+          $script = @'
+          $ErrorActionPreference = 'Continue'
 
-      - name: 4. Keep Alive
+          Set-Culture zh-CN -ErrorAction SilentlyContinue
+          Set-WinUILanguageOverride zh-CN -ErrorAction SilentlyContinue
+
+          $intl = "HKCU:\Control Panel\International"
+          Set-ItemProperty -Path $intl -Name "sShortDate"  -Value "yyyy/M/d"
+          Set-ItemProperty -Path $intl -Name "sLongDate"   -Value "yyyy'年'M'月'd'日'"
+          Set-ItemProperty -Path $intl -Name "sShortTime"  -Value "H:mm"
+          Set-ItemProperty -Path $intl -Name "sTimeFormat" -Value "H:mm:ss"
+
+          try { Install-Language zh-CN -ErrorAction Stop } catch {}
+
+          Remove-Item "$env:ProgramData\rdp-first-login.ps1" -Force -ErrorAction SilentlyContinue
+          '@
+
+          Set-Content -Path "C:\ProgramData\rdp-first-login.ps1" -Value $script -Encoding UTF8
+          Write-Host "✅ 首次登录脚本已写入"
+
+          $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\ProgramData\rdp-first-login.ps1"'
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" `
+                           -Name "!RdpChineseSetup" -Value $cmd -Type String
+          Write-Host "✅ RunOnce 已注册"
+
+      # ============================================================
+      # 4. 安装并连接 Tailscale（用于 RDP）
+      # ============================================================
+      - name: 4. Install & Connect Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $proxyMode = "${{ github.event.inputs.proxy_mode }}"
+
+          if ($proxyMode -eq "exit-node") {
+            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" -Name "IPEnableRouter" -Value 1
+          }
+
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
+          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+          Start-Sleep -Seconds 5
+
+          $tsExe  = "C:\Program Files\Tailscale\tailscale.exe"
+          $tsArgs = @("up", "--authkey=$Env:TAILSCALE_AUTHKEY", "--hostname=github-rdp-$env:GITHUB_RUN_ID")
+
+          if ($proxyMode -eq "exit-node") {
+            $tsArgs += "--advertise-exit-node"
+            $tsArgs += "--accept-routes"
+          }
+
+          & $tsExe @tsArgs *>&1 | Out-Null
+          Start-Sleep -Seconds 8
+          Write-Host "✅ Tailscale 已连接"
+
+      # ============================================================
+      # 5. 安装并配置 Xray（VLESS + WS，监听 127.0.0.1:8080）
+      # ============================================================
+      - name: 5. Install & Configure Xray (VLESS + WS)
+        run: |
+          $wsPort = 8080
+          $wsPath = "/ws"
+          $uuid = [guid]::NewGuid().ToString()
+          $xrayDir = "C:\xray"
+          New-Item -ItemType Directory -Path $xrayDir -Force | Out-Null
+
+          Write-Host "下载 Xray..."
+          $url = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$xrayDir\xray.zip" -UseBasicParsing
+          Expand-Archive -Path "$xrayDir\xray.zip" -DestinationPath $xrayDir -Force
+
+          $config = @{
+            inbounds = @(
+              @{
+                port = $wsPort
+                listen = "127.0.0.1"
+                protocol = "vless"
+                settings = @{
+                  clients = @(
+                    @{
+                      id = $uuid
+                      flow = ""
+                    }
+                  )
+                  decryption = "none"
+                }
+                streamSettings = @{
+                  network = "ws"
+                  wsSettings = @{
+                    path = $wsPath
+                  }
+                }
+              }
+            )
+            outbounds = @(
+              @{
+                protocol = "freedom"
+                settings = @{}
+              }
+            )
+          } | ConvertTo-Json -Depth 10
+
+          Set-Content -Path "$xrayDir\config.json" -Value $config -Encoding UTF8
+
+          Start-Process -FilePath "$xrayDir\xray.exe" `
+            -ArgumentList @("run", "-c", "$xrayDir\config.json") `
+            -WindowStyle Hidden
+
+          Start-Sleep -Seconds 3
+
+          "XRAY_UUID=$uuid"     | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+          "XRAY_WS_PATH=$wsPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
+          Write-Host "✅ Xray (VLESS + WS) 已启动，监听 127.0.0.1:$wsPort"
+
+      # ============================================================
+      # 6. 安装 cloudflared 并暴露 Xray WS 到公网
+      # ============================================================
+      - name: 6. Install cloudflared & Create Tunnel
+        run: |
+          $cfDir = "C:\cloudflared"
+          New-Item -ItemType Directory -Path $cfDir -Force | Out-Null
+
+          Write-Host "下载 cloudflared..."
+          $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          Invoke-WebRequest -Uri $cfUrl -OutFile "$cfDir\cloudflared.exe" -UseBasicParsing
+
+          Write-Host "启动 Quick Tunnel → http://127.0.0.1:8080"
+          Start-Process -FilePath "$cfDir\cloudflared.exe" `
+            -ArgumentList @("tunnel", "--url", "http://127.0.0.1:8080", "--logfile", "$cfDir\tunnel.log", "--no-autoupdate") `
+            -WindowStyle Hidden
+
+          # 等待并解析 tunnel URL
+          $tunnelUrl = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 3
+            if (Test-Path "$cfDir\tunnel.log") {
+              $content = Get-Content "$cfDir\tunnel.log" -Raw
+              $m = [regex]::Match($content, 'https://[a-z0-9-]+\.trycloudflare\.com')
+              if ($m.Success) {
+                $tunnelUrl = $m.Value
+                break
+              }
+            }
+            Write-Host "等待 tunnel URL... ($i)"
+          }
+
+          if (-not $tunnelUrl) {
+            Write-Error "未能获取 cloudflared tunnel URL"
+            if (Test-Path "$cfDir\tunnel.log") { Get-Content "$cfDir\tunnel.log" }
+            exit 1
+          }
+
+          $tunnelHost = ($tunnelUrl -replace 'https://', '')
+
+          "CF_TUNNEL_URL=$tunnelUrl"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+          "CF_TUNNEL_HOST=$tunnelHost" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
+          Write-Host "✅ Cloudflare Tunnel 已建立: $tunnelUrl"
+
+          # 生成 VLESS 链接（TLS + WS）
+          $vlessLink = "vless://$env:XRAY_UUID@${tunnelHost}:443?encryption=none&security=tls&type=ws&host=${tunnelHost}&sni=${tunnelHost}&path=$env:XRAY_WS_PATH#Cloudflare-Node"
+          "XRAY_VLESS_LINK=$vlessLink" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "  Xray + Cloudflare Tunnel 已启动"
+          Write-Host "  协议     : VLESS + WS + TLS"
+          Write-Host "  地址     : $tunnelHost"
+          Write-Host "  端口     : 443"
+          Write-Host "  UUID     : $env:XRAY_UUID"
+          Write-Host "  路径     : $env:XRAY_WS_PATH"
+          Write-Host "  分享链接 : $vlessLink" -ForegroundColor Green
+          Write-Host "=========================================="
+          Write-Host ""
+
+      # ============================================================
+      # 7. 自检 + 打印连接信息
+      # ============================================================
+      - name: 7. Self-Check
+        run: |
+          $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
+
+          Write-Host "===== tailscale status ====="
+          & $tsExe status
+
+          Write-Host ""
+          Write-Host "===== Tailscale IPv4 ====="
+          $tsIp = & $tsExe ip -4
+          Write-Host $tsIp
+
+          Write-Host ""
+          Write-Host "===== Public IP ====="
+          try {
+            $pub = Invoke-RestMethod -Uri "https://ifconfig.me/ip" -TimeoutSec 20
+            Write-Host "Public IP : $pub"
+          } catch {
+            Write-Host "⚠️ 出口 IP 查询失败：$($_.Exception.Message)"
+          }
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "  RDP SERVER IS READY (Tailscale)"
+          Write-Host "  Tailscale IP : $tsIp"
+          Write-Host "  Username     : .\NvdAdmin"
+          Write-Host "  Password     : $env:RDP_PASSWORD" -ForegroundColor Green
+          Write-Host "  Proxy Mode   : ${{ github.event.inputs.proxy_mode }}"
+          if ("${{ github.event.inputs.proxy_mode }}" -eq "exit-node") {
+            Write-Host "  >> 需在 Tailscale 后台勾选 Exit Node:"
+            Write-Host "     https://login.tailscale.com/admin/machines"
+          }
+          Write-Host "=========================================="
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "  Xray 节点 (Cloudflare Tunnel 公网)"
+          Write-Host "  地址     : $env:CF_TUNNEL_HOST"
+          Write-Host "  端口     : 443"
+          Write-Host "  UUID     : $env:XRAY_UUID"
+          Write-Host "  路径     : $env:XRAY_WS_PATH"
+          Write-Host "  分享链接 : $env:XRAY_VLESS_LINK" -ForegroundColor Green
+          Write-Host "=========================================="
+
+      # ============================================================
+      # 8. 清理
+      # ============================================================
+      - name: 8. Cleanup
+        run: |
+          Remove-Item "C:\tailscale.msi" -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\xray\xray.zip" -Force -ErrorAction SilentlyContinue
+          Write-Host "✅ 清理完成"
+
+      # ============================================================
+      # 9. 保活 5 小时
+      # ============================================================
+      - name: 9. Keep Alive (5 hours)
         run: |
           $end = (Get-Date).AddMinutes(300)
+          Write-Host "⏰ 保活至 $end"
+
           while ((Get-Date) -lt $end) {
             Start-Sleep -Seconds 60
-            Write-Host "alive $(Get-Date -Format HH:mm:ss)"
+            $rem = [int]($end - (Get-Date)).TotalMinutes
+            Write-Host "alive @ $((Get-Date).ToString('HH:mm:ss')) | 剩余 $rem min"
           }
+
+          Write-Host "=========================================="
+          Write-Host "  ⚠️ RDP 会话即将断开 — 请保存工作！"
+          Write-Host "=========================================="
