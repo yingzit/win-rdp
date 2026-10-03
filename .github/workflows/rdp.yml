@@ -93,7 +93,7 @@ jobs:
           Write-Host "✅ RunOnce 已注册"
 
       # ============================================================
-      # 4. 安装并连接 Tailscale（用于 RDP）
+      # 4. 安装并连接 Tailscale
       # ============================================================
       - name: 4. Install & Connect Tailscale
         env:
@@ -122,12 +122,15 @@ jobs:
           Write-Host "✅ Tailscale 已连接"
 
       # ============================================================
-      # 5. 安装并配置 Xray（VLESS + WS，监听 127.0.0.1:8080）
+      # 5. 安装并配置 Xray 节点（仅监听 Tailscale IP）
       # ============================================================
-      - name: 5. Install & Configure Xray (VLESS + WS)
+      - name: 5. Install & Configure Xray Node
         run: |
-          $wsPort = 8080
-          $wsPath = "/ws"
+          $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
+          $tsIp = (& $tsExe ip -4 | Select-Object -First 1).Trim()
+          if (-not $tsIp) { Write-Error "未获取到 Tailscale IP"; exit 1 }
+
+          $port = 8443
           $uuid = [guid]::NewGuid().ToString()
           $xrayDir = "C:\xray"
           New-Item -ItemType Directory -Path $xrayDir -Force | Out-Null
@@ -140,8 +143,8 @@ jobs:
           $config = @{
             inbounds = @(
               @{
-                port = $wsPort
-                listen = "127.0.0.1"
+                port = $port
+                listen = $tsIp
                 protocol = "vless"
                 settings = @{
                   clients = @(
@@ -153,10 +156,8 @@ jobs:
                   decryption = "none"
                 }
                 streamSettings = @{
-                  network = "ws"
-                  wsSettings = @{
-                    path = $wsPath
-                  }
+                  network = "tcp"
+                  security = "none"
                 }
               }
             )
@@ -170,82 +171,36 @@ jobs:
 
           Set-Content -Path "$xrayDir\config.json" -Value $config -Encoding UTF8
 
+          New-NetFirewallRule -DisplayName "Xray Node (Tailscale)" `
+            -Direction Inbound -Protocol TCP -LocalPort $port `
+            -RemoteAddress 100.64.0.0/10 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+
           Start-Process -FilePath "$xrayDir\xray.exe" `
             -ArgumentList @("run", "-c", "$xrayDir\config.json") `
             -WindowStyle Hidden
 
           Start-Sleep -Seconds 3
 
-          "XRAY_UUID=$uuid"     | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
-          "XRAY_WS_PATH=$wsPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
-
-          Write-Host "✅ Xray (VLESS + WS) 已启动，监听 127.0.0.1:$wsPort"
-
-      # ============================================================
-      # 6. 安装 cloudflared 并暴露 Xray WS 到公网
-      # ============================================================
-      - name: 6. Install cloudflared & Create Tunnel
-        run: |
-          $cfDir = "C:\cloudflared"
-          New-Item -ItemType Directory -Path $cfDir -Force | Out-Null
-
-          Write-Host "下载 cloudflared..."
-          $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          Invoke-WebRequest -Uri $cfUrl -OutFile "$cfDir\cloudflared.exe" -UseBasicParsing
-
-          Write-Host "启动 Quick Tunnel → http://127.0.0.1:8080"
-          Start-Process -FilePath "$cfDir\cloudflared.exe" `
-            -ArgumentList @("tunnel", "--url", "http://127.0.0.1:8080", "--logfile", "$cfDir\tunnel.log", "--no-autoupdate") `
-            -WindowStyle Hidden
-
-          # 等待并解析 tunnel URL
-          $tunnelUrl = $null
-          for ($i = 0; $i -lt 30; $i++) {
-            Start-Sleep -Seconds 3
-            if (Test-Path "$cfDir\tunnel.log") {
-              $content = Get-Content "$cfDir\tunnel.log" -Raw
-              $m = [regex]::Match($content, 'https://[a-z0-9-]+\.trycloudflare\.com')
-              if ($m.Success) {
-                $tunnelUrl = $m.Value
-                break
-              }
-            }
-            Write-Host "等待 tunnel URL... ($i)"
-          }
-
-          if (-not $tunnelUrl) {
-            Write-Error "未能获取 cloudflared tunnel URL"
-            if (Test-Path "$cfDir\tunnel.log") { Get-Content "$cfDir\tunnel.log" }
-            exit 1
-          }
-
-          $tunnelHost = ($tunnelUrl -replace 'https://', '')
-
-          "CF_TUNNEL_URL=$tunnelUrl"   | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
-          "CF_TUNNEL_HOST=$tunnelHost" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
-
-          Write-Host "✅ Cloudflare Tunnel 已建立: $tunnelUrl"
-
-          # 生成 VLESS 链接（TLS + WS）
-          $vlessLink = "vless://$env:XRAY_UUID@${tunnelHost}:443?encryption=none&security=tls&type=ws&host=${tunnelHost}&sni=${tunnelHost}&path=$env:XRAY_WS_PATH#Cloudflare-Node"
-          "XRAY_VLESS_LINK=$vlessLink" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+          $vlessLink = "vless://$uuid@${tsIp}:${port}?encryption=none&security=none&type=tcp#Windows-RDP-Node"
 
           Write-Host ""
           Write-Host "=========================================="
-          Write-Host "  Xray + Cloudflare Tunnel 已启动"
-          Write-Host "  协议     : VLESS + WS + TLS"
-          Write-Host "  地址     : $tunnelHost"
-          Write-Host "  端口     : 443"
-          Write-Host "  UUID     : $env:XRAY_UUID"
-          Write-Host "  路径     : $env:XRAY_WS_PATH"
+          Write-Host "  Xray 自建节点已启动"
+          Write-Host "  协议     : VLESS + TCP"
+          Write-Host "  地址     : $tsIp"
+          Write-Host "  端口     : $port"
+          Write-Host "  UUID     : $uuid"
           Write-Host "  分享链接 : $vlessLink" -ForegroundColor Green
           Write-Host "=========================================="
           Write-Host ""
 
+          "XRAY_VLESS_LINK=$vlessLink" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+          "TAILSCALE_IP=$tsIp"         | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
       # ============================================================
-      # 7. 自检 + 打印连接信息
+      # 6. 自检 + 打印连接信息
       # ============================================================
-      - name: 7. Self-Check
+      - name: 6. Self-Check
         run: |
           $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
 
@@ -268,7 +223,7 @@ jobs:
 
           Write-Host ""
           Write-Host "=========================================="
-          Write-Host "  RDP SERVER IS READY (Tailscale)"
+          Write-Host "  RDP SERVER IS READY"
           Write-Host "  Tailscale IP : $tsIp"
           Write-Host "  Username     : .\NvdAdmin"
           Write-Host "  Password     : $env:RDP_PASSWORD" -ForegroundColor Green
@@ -280,28 +235,26 @@ jobs:
           Write-Host "=========================================="
 
           Write-Host ""
-          Write-Host "=========================================="
-          Write-Host "  Xray 节点 (Cloudflare Tunnel 公网)"
-          Write-Host "  地址     : $env:CF_TUNNEL_HOST"
-          Write-Host "  端口     : 443"
-          Write-Host "  UUID     : $env:XRAY_UUID"
-          Write-Host "  路径     : $env:XRAY_WS_PATH"
-          Write-Host "  分享链接 : $env:XRAY_VLESS_LINK" -ForegroundColor Green
-          Write-Host "=========================================="
+          Write-Host "===== Xray 自建节点 ====="
+          if ($env:XRAY_VLESS_LINK) {
+            Write-Host $env:XRAY_VLESS_LINK -ForegroundColor Green
+          } else {
+            Write-Host "⚠️ Xray 节点未配置或未成功启动"
+          }
 
       # ============================================================
-      # 8. 清理
+      # 7. 清理
       # ============================================================
-      - name: 8. Cleanup
+      - name: 7. Cleanup
         run: |
           Remove-Item "C:\tailscale.msi" -Force -ErrorAction SilentlyContinue
           Remove-Item "C:\xray\xray.zip" -Force -ErrorAction SilentlyContinue
           Write-Host "✅ 清理完成"
 
       # ============================================================
-      # 9. 保活 5 小时
+      # 8. 保活 5 小时
       # ============================================================
-      - name: 9. Keep Alive (5 hours)
+      - name: 8. Keep Alive (5 hours)
         run: |
           $end = (Get-Date).AddMinutes(300)
           Write-Host "⏰ 保活至 $end"
